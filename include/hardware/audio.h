@@ -24,16 +24,12 @@
 #include <strings.h>
 #include <sys/cdefs.h>
 #include <sys/types.h>
-#include <string.h>
 
 #include <cutils/bitops.h>
 
 #include <hardware/hardware.h>
 #include <system/audio.h>
 #include <hardware/audio_effect.h>
-#ifdef AUDIO_LISTEN_ENABLED
-#include <listen_types.h>
-#endif
 
 __BEGIN_DECLS
 
@@ -124,6 +120,33 @@ __BEGIN_DECLS
  * "sup_sampling_rates=44100|48000" */
 #define AUDIO_PARAMETER_STREAM_SUP_SAMPLING_RATES "sup_sampling_rates"
 
+/* Query handle fm parameter*/
+#define AUDIO_PARAMETER_KEY_HANDLE_FM "handle_fm"
+
+/* Query voip flag */
+#define AUDIO_PARAMETER_KEY_VOIP_CHECK "voip_flag"
+
+/* Query Fluence type */
+#define AUDIO_PARAMETER_KEY_FLUENCE_TYPE "fluence"
+
+/* Query if surround sound recording is supported */
+#define AUDIO_PARAMETER_KEY_SSR "ssr"
+
+/* Query if a2dp  is supported */
+#define AUDIO_PARAMETER_KEY_HANDLE_A2DP_DEVICE "isA2dpDeviceSupported"
+
+/* Query ADSP Status */
+#define AUDIO_PARAMETER_KEY_ADSP_STATUS "ADSP_STATUS"
+
+/* Query Sound Card Status */
+#define AUDIO_PARAMETER_KEY_SND_CARD_STATUS "SND_CARD_STATUS"
+
+/* Query if Proxy can be Opend */
+#define AUDIO_CAN_OPEN_PROXY "can_open_proxy"
+
+/* Query fm volume */
+#define AUDIO_PARAMETER_KEY_FM_VOLUME "fm_volume"
+
 /**
  * audio codec parameters
  */
@@ -141,30 +164,6 @@ __BEGIN_DECLS
 #define AUDIO_OFFLOAD_CODEC_DELAY_SAMPLES  "delay_samples"
 #define AUDIO_OFFLOAD_CODEC_PADDING_SAMPLES  "padding_samples"
 
-/* Query handle fm parameter*/
-#define AUDIO_PARAMETER_KEY_HANDLE_FM "handle_fm"
-
-/* Query fm volume */
-#define AUDIO_PARAMETER_KEY_FM_VOLUME "fm_volume"
-
-/* Query Fluence type */
-#define AUDIO_PARAMETER_KEY_FLUENCE "fluence"
-
-/* Query if surround sound recording is supported */
-#define AUDIO_PARAMETER_KEY_SSR "ssr"
-
-/* Query if a2dp  is supported */
-#define AUDIO_PARAMETER_KEY_HANDLE_A2DP_DEVICE "isA2dpDeviceSupported"
-
-/* Query ADSP Status */
-#define AUDIO_PARAMETER_KEY_ADSP_STATUS "ADSP_STATUS"
-
-/* Query Sound Card Status */
-#define AUDIO_PARAMETER_KEY_SND_CARD_STATUS "SND_CARD_STATUS"
-
-/* Query if Proxy can be Opend */
-#define AUDIO_PARAMETER_KEY_CAN_OPEN_PROXY "can_open_proxy"
-
 /**************************************/
 
 /* common audio stream configuration parameters
@@ -178,6 +177,16 @@ struct audio_config {
     audio_offload_info_t offload_info;
 };
 typedef struct audio_config audio_config_t;
+
+#ifdef QCOM_DIRECTTRACK
+/** Structure to save buffer information for applying effects for
+ *  LPA buffers */
+struct buf_info {
+    int bufsize;
+    int nBufs;
+    int **buffers;
+};
+#endif
 
 /* common audio stream parameters and operations */
 struct audio_stream {
@@ -325,6 +334,18 @@ struct audio_stream_out {
     int (*get_render_position)(const struct audio_stream_out *stream,
                                uint32_t *dsp_frames);
 
+#ifdef QCOM_DIRECTTRACK
+    /**
+     * start audio data rendering
+     */
+    int (*start)(struct audio_stream_out *stream);
+
+    /**
+     * stop audio data rendering
+     */
+    int (*stop)(struct audio_stream_out *stream);
+#endif
+
     /**
      * get the local time at which the next write to the audio driver will be presented.
      * The units are microseconds, where the epoch is decided by the local audio HAL.
@@ -406,6 +427,30 @@ struct audio_stream_out {
     int (*get_presentation_position)(const struct audio_stream_out *stream,
                                uint64_t *frames, struct timespec *timestamp);
 
+#ifdef QCOM_DIRECTTRACK
+    /**
+    * return the current timestamp after quering to the driver
+     */
+    int (*get_time_stamp)(const struct audio_stream_out *stream,
+                               uint64_t *time_stamp);
+    /**
+    * EOS notification from HAL to Player
+     */
+    int (*set_observer)(const struct audio_stream_out *stream,
+                               void *observer);
+    /**
+     * Get the physical address of the buffer allocated in the
+     * driver
+     */
+    int (*get_buffer_info) (const struct audio_stream_out *stream,
+                                struct buf_info **buf);
+    /**
+     * Check if next buffer is available. Waits until next buffer is
+     * available
+     */
+    int (*is_buffer_available) (const struct audio_stream_out *stream,
+                                     int *isAvail);
+#endif
 };
 typedef struct audio_stream_out audio_stream_out_t;
 
@@ -443,6 +488,52 @@ typedef struct audio_stream_in audio_stream_in_t;
 static inline size_t audio_stream_frame_size(const struct audio_stream *s)
 {
     size_t chan_samp_sz;
+#ifdef QCOM_DIRECTTRACK
+    uint32_t chan_mask = s->get_channels(s);
+    int format = s->get_format(s);
+    char *tmpparam;
+    int isParamEqual;
+
+    if(!s)
+        return 0;
+    if (audio_is_input_channel(chan_mask)) {
+        chan_mask &= (AUDIO_CHANNEL_IN_STEREO | \
+                      AUDIO_CHANNEL_IN_MONO | \
+                      AUDIO_CHANNEL_IN_5POINT1);
+    }
+    tmpparam = s->get_parameters(s, "voip_flag");
+    isParamEqual = !strncmp(tmpparam,"voip_flag=1", sizeof("voip_flag=1"));
+    free(tmpparam);
+    if(isParamEqual) {
+        if(format != AUDIO_FORMAT_PCM_8_BIT)
+            return popcount(chan_mask) * sizeof(int16_t);
+        else
+            return popcount(chan_mask) * sizeof(int8_t);
+    }
+
+    switch (format) {
+    case AUDIO_FORMAT_AMR_NB:
+        chan_samp_sz = 32;
+        break;
+    case AUDIO_FORMAT_EVRC:
+        chan_samp_sz = 23;
+        break;
+    case AUDIO_FORMAT_QCELP:
+        chan_samp_sz = 35;
+        break;
+    case AUDIO_FORMAT_AMR_WB:
+        chan_samp_sz = 61;
+        break;
+    case AUDIO_FORMAT_PCM_16_BIT:
+        chan_samp_sz = sizeof(int16_t);
+        break;
+    case AUDIO_FORMAT_PCM_8_BIT:
+    default:
+        chan_samp_sz = sizeof(int8_t);
+        break;
+    }
+    return popcount(chan_mask) * chan_samp_sz;
+#else
     audio_format_t format = s->get_format(s);
 
     if (audio_is_linear_pcm(format) &&
@@ -450,7 +541,9 @@ static inline size_t audio_stream_frame_size(const struct audio_stream *s)
         chan_samp_sz = audio_bytes_per_sample(format);
         return popcount(s->get_channels(s)) * chan_samp_sz;
     }
+
     return sizeof(int8_t);
+#endif
 }
 
 
@@ -574,26 +667,6 @@ struct audio_hw_device {
      */
     int (*get_master_mute)(struct audio_hw_device *dev, bool *mute);
 
-#ifdef AUDIO_LISTEN_ENABLED
-    /** This method opens the listen session and returns a handle */
-    int (*open_listen_session)(struct audio_hw_device *dev,
-                               struct listen_session** handle);
-
-    /** This method closes the listen session  */
-    int (*close_listen_session)(struct audio_hw_device *dev,
-                                struct listen_session* handle);
-
-    /** This method sets the mad observer callback  */
-    int (*set_mad_observer)(struct audio_hw_device *dev,
-                            listen_callback_t cb_func);
-
-    /*  This method is used for setting listen hal specfic parameters.
-     *  If multiple paramets are set in one call and setting any one of them
-     *  fails it will return failure.
-     */
-    int (*listen_set_parameters)(struct audio_hw_device *dev,
-                                 const char *kv_pairs);
-#endif
 };
 typedef struct audio_hw_device audio_hw_device_t;
 
@@ -611,7 +684,18 @@ static inline int audio_hw_device_close(struct audio_hw_device* device)
     return device->common.close(&device->common);
 }
 
-
+#ifdef QCOM_DIRECTTRACK
+#ifdef __cplusplus
+/**
+ *Observer class to post the Events from HAL to Flinger
+*/
+class AudioEventObserver {
+public:
+    virtual ~AudioEventObserver() {}
+    virtual void postEOS(int64_t delayUs) = 0;
+};
+#endif
+#endif
 __END_DECLS
 
 #endif  // ANDROID_AUDIO_INTERFACE_H
